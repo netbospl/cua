@@ -87,6 +87,10 @@ def test_planner_requires_main_ancestry_and_preserves_immutable_evidence():
     assert "needs.plan.outputs.reason == 'held-attribution'" in planner
     assert "gh issue create" in planner
     assert "gh issue edit" in planner
+    assert 'git log -n 1 --format=%H -S"$BASE_VERSION" -- "$VERSION_FILE"' in planner
+    assert 'git tag "$STABLE_TAG" "$BASE_SHA"' in planner
+    assert '"$PLANNED_REF" == "$SYNTHETIC_TAG"' in planner
+    assert "steps.attribution_base.outputs.ref" in planner
     assert "cancel-in-progress: false" in source("nightly-cua-driver.yml")
     assert "cancel-in-progress: false" in source("nightly-lume.yml")
 
