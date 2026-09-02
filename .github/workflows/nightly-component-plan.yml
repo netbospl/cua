@@ -47,7 +47,7 @@ jobs:
       bundle_version: ${{ steps.plan.outputs.bundleVersion }}
       tag: ${{ steps.plan.outputs.tag }}
       previous_tag: ${{ steps.plan.outputs.previousTag }}
-      attribution_base_tag: ${{ steps.plan.outputs.attributionBaseTag }}
+      attribution_base_tag: ${{ steps.attribution_base.outputs.ref }}
       reason: ${{ steps.plan.outputs.reason }}
       attribution_issues: ${{ steps.plan.outputs.attributionIssues }}
     steps:
@@ -74,6 +74,49 @@ jobs:
             "repos/${{ github.repository }}/releases?per_page=100" \
             | jq 'add' > "$RUNNER_TEMP/releases.json"
 
+      - name: Prepare missing stable attribution anchor
+        id: attribution_bootstrap
+        env:
+          COMPONENT: ${{ inputs.component }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          VERSION_FILE=$(jq -er --arg component "$COMPONENT" \
+            '.components[$component].versionAuthorityFile' \
+            .github/releases/components.json)
+          STABLE_PREFIX=$(jq -er --arg component "$COMPONENT" \
+            '.components[$component].stableTagPrefix' \
+            .github/releases/components.json)
+          BASE_VERSION=$(tr -d '\r\n' < "$VERSION_FILE")
+          test -n "$BASE_VERSION"
+          STABLE_TAG="${STABLE_PREFIX}${BASE_VERSION}"
+
+          if git rev-parse --verify --quiet "${STABLE_TAG}^{commit}" >/dev/null; then
+            exit 0
+          fi
+
+          BASE_SHA=$(git log -n 1 --format=%H -S"$BASE_VERSION" -- "$VERSION_FILE")
+          if [[ -z "$BASE_SHA" ]]; then
+            echo "::error::Cannot find a commit that introduced $BASE_VERSION in $VERSION_FILE"
+            exit 1
+          fi
+          RECORDED_VERSION=$(git show "${BASE_SHA}:${VERSION_FILE}" | tr -d '\r\n')
+          if [[ "$RECORDED_VERSION" != "$BASE_VERSION" ]]; then
+            echo "::error::Attribution anchor $BASE_SHA records $RECORDED_VERSION, expected $BASE_VERSION"
+            exit 1
+          fi
+          git merge-base --is-ancestor "$BASE_SHA" "$SOURCE_SHA"
+
+          # The planner's first-nightly contract expects a stable tag. Create a
+          # checkout-local alias so planning/preflight can stay tag-based, then
+          # export the commit SHA for downstream jobs where this local tag does
+          # not exist.
+          git tag "$STABLE_TAG" "$BASE_SHA"
+          {
+            echo "synthetic_tag=$STABLE_TAG"
+            echo "fallback_ref=$BASE_SHA"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Plan immutable nightly
         id: plan
         env:
@@ -95,6 +138,21 @@ jobs:
             --github-output "$GITHUB_OUTPUT" \
             "${FORCE[@]}"
           cat "$RUNNER_TEMP/nightly-plan.json"
+
+      - name: Resolve portable attribution base
+        id: attribution_base
+        env:
+          PLANNED_REF: ${{ steps.plan.outputs.attributionBaseTag }}
+          SYNTHETIC_TAG: ${{ steps.attribution_bootstrap.outputs.synthetic_tag }}
+          FALLBACK_REF: ${{ steps.attribution_bootstrap.outputs.fallback_ref }}
+        run: |
+          set -euo pipefail
+          REF="$PLANNED_REF"
+          if [[ -n "$SYNTHETIC_TAG" && "$PLANNED_REF" == "$SYNTHETIC_TAG" ]]; then
+            REF="$FALLBACK_REF"
+          fi
+          test -n "$REF"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
 
       - name: Preserve plan
         uses: actions/upload-artifact@v4
