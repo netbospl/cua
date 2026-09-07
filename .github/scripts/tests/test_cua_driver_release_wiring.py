@@ -734,7 +734,12 @@ class TestCuaDriverReleaseWiring(unittest.TestCase):
         self.assertIn("workflow_call:\n", workflow)
         self.assertIn("Installer compatibility summary", workflow)
         self.assertIn("ubuntu-latest, macos-26, windows-latest", workflow)
-        self.assertIn("repos/$GITHUB_REPOSITORY/releases?per_page=100", workflow)
+        self.assertIn("CUA_DRIVER_RELEASE_REPOSITORY: trycua/cua", workflow)
+        self.assertIn(
+            "repos/$CUA_DRIVER_RELEASE_REPOSITORY/releases?per_page=100",
+            workflow,
+        )
+        self.assertNotIn("repos/$GITHUB_REPOSITORY/releases?per_page=100", workflow)
         self.assertIn("libs/cua-driver/scripts/install.sh", workflow)
         self.assertIn("libs/cua-driver/scripts/install.ps1", workflow)
         self.assertIn("-NoAutoStart", workflow)
