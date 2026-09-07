@@ -21,6 +21,13 @@ permissions:
   contents: read
   pull-requests: read
 
+# The installers intentionally consume official Cua Driver artifacts from the
+# canonical release repository. Keep release discovery pointed at the same
+# repository so this workflow also works when it runs from a fork, whose own
+# GitHub Releases collection may be empty.
+env:
+  CUA_DRIVER_RELEASE_REPOSITORY: trycua/cua
+
 jobs:
   scope:
     name: Resolve installer compatibility scope
@@ -61,7 +68,7 @@ jobs:
               jq -Rsc 'split("\n") | map(select(length > 0)) | unique')
           else
             VERSIONS=$(gh api --paginate --slurp \
-              "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+              "repos/$CUA_DRIVER_RELEASE_REPOSITORY/releases?per_page=100" |
               jq -c '[
                 .[][]
                 | select(.draft == false)
@@ -72,7 +79,7 @@ jobs:
           fi
 
           if [[ "$(jq 'length' <<< "$VERSIONS")" -eq 0 ]]; then
-            echo "No published Cua Driver release was found" >&2
+            echo "No published Cua Driver release was found in $CUA_DRIVER_RELEASE_REPOSITORY" >&2
             exit 1
           fi
           while IFS= read -r version; do
@@ -82,6 +89,7 @@ jobs:
             fi
           done < <(jq -r '.[]' <<< "$VERSIONS")
           echo "versions=$VERSIONS" >> "$GITHUB_OUTPUT"
+          echo "Release source: $CUA_DRIVER_RELEASE_REPOSITORY"
           echo "Testing released versions: $(jq -r 'join(", ")' <<< "$VERSIONS")"
 
   install:
