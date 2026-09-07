@@ -54,6 +54,25 @@ class TestReleaseBumpAuthorization(unittest.TestCase):
         )
         self.assertIn("No owner-authorized release labels found", workflow)
 
+    def test_auto_release_falls_back_to_github_token_on_forks(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github/workflows/release-on-merge.yml"
+        ).read_text()
+
+        self.assertIn("  issues: read\n", workflow)
+        self.assertIn("Detect release GitHub App credentials", workflow)
+        self.assertIn('RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}', workflow)
+        self.assertIn(
+            'RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}',
+            workflow,
+        )
+        self.assertIn("if: steps.release-auth.outputs.use_app == 'true'", workflow)
+        self.assertIn("falling back to GITHUB_TOKEN", workflow)
+        self.assertIn(
+            "GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}",
+            workflow,
+        )
+
     def test_release_comments_cannot_authorize_or_render_release_checkboxes(
         self,
     ) -> None:
