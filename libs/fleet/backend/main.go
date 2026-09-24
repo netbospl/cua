@@ -33,8 +33,12 @@ import (
 	"syscall"
 	"time"
 
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+
 	"github.com/spf13/cobra"
 
+	"cyclops-cs-backend/accountlookup"
 	"cyclops-cs-backend/auth"
 	"cyclops-cs-backend/billing"
 	"cyclops-cs-backend/chat"
@@ -127,6 +131,18 @@ func onlyLog(route string, h http.HandlerFunc) http.Handler {
 }
 
 func setupRouter(c handlers.Handlers) http.Handler {
+	// Observe validated, owner-normalized identities without blocking requests.
+	authenticated := withAuthenticatedMiddlewares
+	withAuthenticatedMiddlewares := func(route string, handler http.HandlerFunc, observers ...auth.Middleware) http.Handler {
+		if c.AccountLookup != nil {
+			observers = append([]auth.Middleware{c.AccountLookup.Observe}, observers...)
+		}
+		wrapped := authenticated(route, handler, observers...)
+		if route == "/api/admin/account-lookup" {
+			return handlers.PrivateAccountLookup(wrapped)
+		}
+		return wrapped
+	}
 	// The namespace-ownership conjunct on /api/svc and
 	// /api/namespaces/{name} asks Kubernetes a question, through a probe that
 	// is a handlers method. auth cannot import handlers, so the policy names
@@ -152,6 +168,8 @@ func setupRouter(c handlers.Handlers) http.Handler {
 		withAuthenticatedMiddlewares("/api/analytics/session", c.RecordAnalyticsSession))
 	r.Handle("POST /api/analytics/attribution",
 		withAuthenticatedMiddlewares("/api/analytics/attribution", c.RecordFleetAttribution))
+	r.Handle("POST /api/analytics/payment-gate",
+		withAuthenticatedMiddlewares("/api/analytics/payment-gate", c.RecordFleetPaymentGate))
 
 	r.Handle("POST /api/chat/conversations",
 		withAuthenticatedMiddlewares("/api/chat/conversations", c.CreateConversation))
@@ -170,9 +188,15 @@ func setupRouter(c handlers.Handlers) http.Handler {
 	r.Handle("GET /api/usage/pool", withAuthenticatedMiddlewares("/api/usage/pool", c.GetUsagePoolDetail))
 	r.Handle("POST /api/usage/browser-timings", withAuthenticatedMiddlewares("/api/usage/browser-timings", c.RecordUsageBrowserTimings))
 	r.Handle("GET /api/admin/feature-flags", withAuthenticatedMiddlewares("/api/admin/feature-flags", c.ListFeatureFlags))
+	r.Handle("POST /api/admin/account-lookup", withAuthenticatedMiddlewares("/api/admin/account-lookup", c.LookupAccount, c.AuditAccountLookupAccess))
 	r.Handle("POST /api/admin/feature-flags", withAuthenticatedMiddlewares("/api/admin/feature-flags", c.CreateFeatureFlag))
 	r.Handle("PUT /api/admin/feature-flags/{key}", withAuthenticatedMiddlewares("/api/admin/feature-flags/{key}", c.UpdateFeatureFlag))
 	r.Handle("DELETE /api/admin/feature-flags/{key}", withAuthenticatedMiddlewares("/api/admin/feature-flags/{key}", c.DeleteFeatureFlag))
+
+	r.Handle("POST /api/image-uploads/presign",
+		withAuthenticatedMiddlewares("/api/image-uploads/presign", c.PresignImageUploads))
+	r.Handle("GET /api/images/resolve",
+		withAuthenticatedMiddlewares("/api/images/resolve", c.ResolveImage))
 
 	// Stripe-hosted billing. Browser routes require the normal SPA JWT; the
 	// webhook uses Stripe signature verification as its authentication boundary.
@@ -182,6 +206,8 @@ func setupRouter(c handlers.Handlers) http.Handler {
 		withAuthenticatedMiddlewares("/api/billing/usage", c.GetBillingUsage))
 	r.Handle("POST /api/billing/setup-session",
 		withAuthenticatedMiddlewares("/api/billing/setup-session", c.CreateBillingSetupSession))
+	r.Handle("POST /api/billing/setup-session/complete",
+		withAuthenticatedMiddlewares("/api/billing/setup-session/complete", c.CompleteBillingSetupSession))
 	r.Handle("POST /api/billing/portal-session",
 		withAuthenticatedMiddlewares("/api/billing/portal-session", c.CreateBillingPortalSession))
 	r.Handle("POST /api/billing/webhook",
@@ -317,6 +343,17 @@ func initializeFeatureFlags(ctx context.Context, environment string, credentials
 	return nil
 }
 
+func newImageObjectStore(ctx context.Context, cfg config.ImageUploadConfiguration) (handlers.ImageObjectStore, error) {
+	if strings.TrimSpace(cfg.Bucket) == "" {
+		return nil, nil
+	}
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cfg.Region))
+	if err != nil {
+		return nil, fmt.Errorf("load image upload AWS config: %w", err)
+	}
+	return handlers.NewS3ImageObjectStore(s3.NewFromConfig(awsCfg), cfg.Bucket), nil
+}
+
 func run() error {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -396,6 +433,9 @@ func run() error {
 
 	h := handlers.New(admin, cfg)
 	h.Analytics = analyticsClient
+	lookupService, closeLookup, lookupErr := initializeAccountLookup(ctx, cfg, admin)
+	h.AccountLookup = lookupService
+	defer closeLookup()
 	signedServiceURLsContext, cancelSignedServiceURLs := context.WithCancel(ctx)
 	defer cancelSignedServiceURLs()
 	var signedServiceURLsRetry sync.WaitGroup
@@ -417,7 +457,7 @@ func run() error {
 	defer shutdownSignedServiceURLs(cancelSignedServiceURLs, &signedServiceURLsRetry, &signedServiceURLsMu, &closeSignedServiceURLs)
 	usageProvider, closeUsageProvider, err := initializeUsageProvider(ctx, cfg.Usage)
 	if err != nil {
-		return errors.Join(fmt.Errorf("initialize usage provider: %w", err), startupErrors, telemetryErr)
+		return errors.Join(fmt.Errorf("initialize usage provider: %w", err), startupErrors, telemetryErr, lookupErr)
 	}
 	defer closeUsageProvider()
 	h.Usage = usageProvider
@@ -431,7 +471,7 @@ func run() error {
 		if cfg.Database.URL != "" {
 			conversationStore, conversationStoreErr := chat.NewPostgresConversationStore(ctx, cfg.Database.URL)
 			if conversationStoreErr != nil {
-				return errors.Join(fmt.Errorf("initialize chat conversation store: %w", conversationStoreErr), startupErrors, telemetryErr)
+				return errors.Join(fmt.Errorf("initialize chat conversation store: %w", conversationStoreErr), startupErrors, telemetryErr, lookupErr)
 			}
 			defer conversationStore.Close()
 			h.Conversations = conversationStore
@@ -458,6 +498,15 @@ func run() error {
 		lease := featureflagadmin.NewKubernetesLeaseLock(leaseConfig.apiBaseURL, leaseConfig.namespace, leaseConfig.name, leaseConfig.holderIdentity, 30*time.Second, 5*time.Second, time.Now)
 		h.FeatureFlags = newFeatureFlagAdminService(managementStore, lease)
 	}
+	h.ImageObjects, err = newImageObjectStore(ctx, cfg.ImageUploads)
+	if err != nil {
+		return errors.Join(err, startupErrors, telemetryErr, lookupErr)
+	}
+	if h.ImageObjects != nil {
+		slog.Info("image uploads: presigning enabled", "region", cfg.ImageUploads.Region)
+	} else {
+		slog.Info("image uploads: disabled (IMAGE_UPLOAD_BUCKET unset)")
+	}
 	if cfg.Stripe.SecretKey != "" {
 		h.Billing = billing.NewService(billing.NewStripeGateway(cfg.Stripe.SecretKey))
 		slog.Info("stripe billing: hosted flows enabled")
@@ -480,7 +529,22 @@ func run() error {
 	router := setupRouter(h)
 
 	srv := &http.Server{Addr: cfg.WebServer.Addr, Handler: router}
-	return errors.Join(serveUntilCanceled(ctx, srv), startupErrors, telemetryErr)
+	return errors.Join(serveUntilCanceled(ctx, srv), startupErrors, telemetryErr, lookupErr)
+}
+
+// Lazy pool connections keep this optional feature independent of serving readiness.
+func initializeAccountLookup(ctx context.Context, cfg *config.Configuration, admin *keycloak.Admin) (*accountlookup.Service, func(), error) {
+	if cfg.Database.URL == "" || cfg.ProductAnalytics.IdentityKey == "" {
+		return nil, func() {}, nil
+	}
+	store, err := accountlookup.NewStore(ctx, cfg.Database.URL)
+	if err != nil {
+		slog.Warn("account lookup unavailable: invalid database configuration")
+		return nil, func() {}, err
+	}
+	lookupCtx, cancel := context.WithCancel(ctx)
+	service := accountlookup.New(lookupCtx, store, admin, cfg.Keycloak.Realm, cfg.ProductAnalytics.IdentityKey, cfg.ProductAnalytics.ExcludedSubjects)
+	return service, func() { cancel(); service.Wait(); store.Close() }, nil
 }
 
 // startSignedServiceURLs installs the signed service URL dependency on first

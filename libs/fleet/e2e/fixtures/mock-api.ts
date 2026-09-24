@@ -116,6 +116,7 @@ export async function mockAuth(
             this.realmAccess = { roles: [] };
             this.resourceAccess = {};
             this.subject = "test-user-id";
+            this.sessionId = "test-session-id";
           }
           async init(options) {
             window.__MOCK_KEYCLOAK__.initOptions = options;
@@ -635,7 +636,18 @@ export async function mockGitHubTrustPoliciesApi(
 // Pools API mocking (K8s CRD via kubectl-proxy sidecar)
 // ---------------------------------------------------------------------------
 
-export async function mockPoolsApi(page: Page): Promise<void> {
+export interface MockPoolService {
+  name: string;
+  targetPort: number;
+  protocol: string;
+}
+
+export async function mockPoolsApi(
+  page: Page,
+  services: MockPoolService[] = [
+    { name: "mcp", targetPort: 8080, protocol: "TCP" },
+  ],
+): Promise<void> {
   const pool = {
     apiVersion: "osgym.cua.ai/v1alpha1",
     kind: "OSGymSandboxWarmPool",
@@ -656,7 +668,7 @@ export async function mockPoolsApi(page: Page): Promise<void> {
         containerDiskImage: "test-image:latest",
         cpuCores: 4,
         memory: "4Gi",
-        services: [{ name: "mcp", targetPort: 8080, protocol: "TCP" }],
+        services,
       },
     },
   };

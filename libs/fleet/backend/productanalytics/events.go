@@ -23,8 +23,16 @@ func ClassifyIdentity(user *auth.User) IdentityClass {
 	if user == nil || strings.TrimSpace(user.ID) == "" {
 		return IdentityUnknown
 	}
-	// Only verified company-domain evidence excludes an authenticated user from growth counts.
+	// Verified company-domain evidence or trusted admin-owner membership is
+	// internal regardless of the authentication client (SPA, CLI, or user key).
 	if user.EmailVerified && strings.HasSuffix(strings.ToLower(strings.TrimSpace(user.Email)), "@trycua.com") {
+		return IdentityInternal
+	}
+	admin, resolved := auth.AdminSubjectMembership(user.ID)
+	if !resolved {
+		return IdentityUnknown
+	}
+	if admin {
 		return IdentityInternal
 	}
 	return IdentityExternal
@@ -61,6 +69,8 @@ func loginSessionKey(user *auth.User) string {
 
 const (
 	EventLoginSucceeded        = "fleet_login_succeeded"
+	EventPaymentGateShown      = "fleet_payment_gate_shown"
+	EventPaymentSetupStart     = "fleet_payment_setup_start"
 	EventPaymentMethodSetup    = "fleet_payment_method_setup"
 	EventPoolCreate            = "fleet_pool_create"
 	EventClaimCreate           = "fleet_claim_create"
@@ -83,10 +93,13 @@ const (
 	SourceCLI      = "cli"
 	SourceUserKey  = "user_key"
 	Version        = "1"
+
+	ReasonNoPaymentMethod       = "no_payment_method"
+	ReasonCardAdmissionRequired = "card_admission_required"
 )
 
 var allowedEvents = map[string]struct{}{
-	EventLoginSucceeded: {}, EventPaymentMethodSetup: {}, EventPoolCreate: {},
+	EventLoginSucceeded: {}, EventPaymentGateShown: {}, EventPaymentSetupStart: {}, EventPaymentMethodSetup: {}, EventPoolCreate: {},
 	EventClaimCreate: {}, EventHTTPProxyRequest: {},
 	EventFleetActivation:    {},
 	EventQualifyingWorkload: {},
@@ -99,11 +112,20 @@ var allowedProperties = map[string]struct{}{
 	"error_class": {}, "environment": {}, "instrumentation_version": {},
 	"identity_class": {},
 	"resource_type":  {}, "reason": {},
+	"qualification_lookup_stage": {}, "qualification_error_class": {},
+}
+
+var allowedQualificationLookupStages = map[string]struct{}{"sandbox": {}, "claim": {}, "pool": {}, "unknown": {}}
+var allowedQualificationErrorClasses = map[string]struct{}{
+	"deadline_exceeded": {}, "canceled": {}, "timeout": {}, "unauthenticated": {}, "forbidden": {},
+	"not_found": {}, "rate_limited": {}, "upstream_5xx": {}, "unexpected_status": {},
+	"invalid_response": {}, "invalid_binding": {}, "missing_identity": {}, "invalid_request": {},
+	"request_failed": {}, "unknown": {},
 }
 
 var allowedResourceTypes = map[string]struct{}{"pool": {}, "template": {}, "claim": {}}
 var allowedReasons = map[string]struct{}{
-	"payment_required": {}, "authorization": {}, "validation": {}, "quota": {}, "timeout": {}, "internal": {},
+	"payment_required": {}, ReasonNoPaymentMethod: {}, ReasonCardAdmissionRequired: {}, "authorization": {}, "validation": {}, "quota": {}, "timeout": {}, "internal": {},
 	"not_svc_route": {}, "invalid_method": {}, "upgrade_request": {}, "binding_lookup_failed": {}, "claim_missing": {},
 	"claim_mismatch": {}, "claim_not_bound": {}, "sandbox_missing": {},
 	"service_mismatch": {}, "pool_lookup_failed": {}, "pool_missing": {}, "non_2xx": {}, "probe_request": {}, "facts_unavailable": {},
@@ -208,12 +230,39 @@ func ValidateEvent(event Event) error {
 		if _, valid := allowedReasons[value]; !valid {
 			return fmt.Errorf("unsupported analytics reason")
 		}
+		if event.Name != EventPaymentGateShown && (value == ReasonNoPaymentMethod || value == ReasonCardAdmissionRequired) {
+			return fmt.Errorf("payment gate reason requires payment gate event")
+		}
 	}
 	if event.Name == EventResourceBlocked && (!hasResourceType || !hasReason) {
 		return fmt.Errorf("resource block event requires resource type and reason")
 	}
+	if event.Name == EventPaymentGateShown {
+		resource, resourceOK := resourceType.(string)
+		reasonValue, reasonOK := reason.(string)
+		if !hasResourceType || !hasReason || !resourceOK || resource != "pool" || !reasonOK || (reasonValue != ReasonNoPaymentMethod && reasonValue != ReasonCardAdmissionRequired) {
+			return fmt.Errorf("payment gate event requires pool resource type and payment gate reason")
+		}
+	}
 	if event.Name == EventQualificationRejected && !hasReason {
 		return fmt.Errorf("qualification rejection event requires reason")
+	}
+	stage, hasStage := event.Properties["qualification_lookup_stage"]
+	class, hasClass := event.Properties["qualification_error_class"]
+	if hasStage || hasClass {
+		stageValue, stageOK := stage.(string)
+		classValue, classOK := class.(string)
+		_, stageAllowed := allowedQualificationLookupStages[stageValue]
+		_, classAllowed := allowedQualificationErrorClasses[classValue]
+		if !stageOK || !classOK || !stageAllowed || !classAllowed {
+			return fmt.Errorf("qualification lookup diagnostics require bounded stage and error class")
+		}
+		if event.Name != EventQualificationRejected || (reason != "binding_lookup_failed" && reason != "pool_lookup_failed") {
+			return fmt.Errorf("qualification lookup diagnostics require lookup rejection")
+		}
+		if (reason == "pool_lookup_failed") != (stageValue == "pool") {
+			return fmt.Errorf("qualification lookup stage must match rejection reason")
+		}
 	}
 	return nil
 }
